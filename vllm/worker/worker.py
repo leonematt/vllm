@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Set, Tuple, Type, Union
 import torch
 import torch.distributed
 
+import nexus
+
 import vllm.envs as envs
 from vllm.attention.layer import Attention
 from vllm.config import VllmConfig, get_layers_from_vllm_config
@@ -180,8 +182,10 @@ class Worker(LocalOrDistributedWorkerBase):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             self.device = torch.device(f"cuda:{self.local_rank}")
-            torch.cuda.set_device(self.device)
-
+            #torch.cuda.set_device(self.device)
+            nexus.get_runtimes()
+            runtime = nexus.get_runtime("cuda")
+            runtime.set_device(self.local_rank)
             _check_if_gpu_supports_dtype(self.model_config.dtype)
             gc.collect()
             torch.cuda.empty_cache()
