@@ -149,6 +149,9 @@ void rotary_embedding(
   int64_t num_tokens = positions.numel();
   int positions_ndim = positions.dim();
 
+    //TORCH_CHECK(false, "[VLLM-DEBUG] rotary/batched_rotary called at: ");
+    //std::abort();
+  
   // Make sure num_tokens dim is consistent across positions, query, and key
   TORCH_CHECK(
       positions_ndim == 1 || positions_ndim == 2,
@@ -234,6 +237,11 @@ void batched_rotary_embedding(
     torch::Tensor& cos_sin_cache_offsets  // [num_tokens] or [batch_size]
 ) {
   // num_tokens = batch_size * seq_len
+  
+  TORCH_CHECK(false, "[VLLM-DEBUG] rotary/batched_rotary called at: ");
+  
+
+  
   int64_t num_tokens = cos_sin_cache_offsets.size(0);
   TORCH_CHECK(
       positions.size(0) == num_tokens || positions.numel() == num_tokens,
