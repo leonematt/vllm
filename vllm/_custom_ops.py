@@ -244,17 +244,163 @@ def convert_vertical_slash_indexes_mergehead(
     return block_count, block_offset, column_count, column_index
 
 
-# pos encoding ops
+
+
+
+# vllm/rotary.py  — Nexus-backed ROPE launcher (drop-in for the Torch op)
+from typing import Optional
+import torch
+import nexus
+
+_PTX_PATH = "/home/leonematt/dev/nexus/build.local/cuda_kernels/pos_encoding_kernels.cu.ptx"
+_KERNELS = {
+    # dtype, is_neox -> mangled symbol
+    (torch.bfloat16, True):  "_ZN4vllm23rotary_embedding_kernelIN3c108BFloat16ELb1EEEvPKlPT_S6_PKS5_illliii",
+    (torch.bfloat16, False): "_ZN4vllm23rotary_embedding_kernelIN3c108BFloat16ELb0EEEvPKlPT_S6_PKS5_illliii",
+    # Add other variants if compiled:
+    # (torch.float32,  True):  "_ZN4vllm23rotary_embedding_kernelIfLb1EEEvPKlPT_S4_PKS3_illliii",
+    # (torch.float32,  False): "_ZN4vllm23rotary_embedding_kernelIfLb0EEEvPKlPT_S4_PKS3_illliii",
+    # (torch.float16,  True):  "...",
+    # (torch.float16,  False): "...",
+}
+
+def _pick_device() -> "nexus.Device":
+    rt = nexus.get_runtime("cuda")
+    if not rt:
+        raise RuntimeError("Nexus: no CUDA runtime")
+    for d in rt.get_devices():
+        if d.get_property_str(nexus.property.Type) == "gpu":
+            return d
+    raise RuntimeError("Nexus: no GPU device")
+
 def rotary_embedding(
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: Optional[torch.Tensor],
-    head_size: int,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
+    positions: torch.Tensor,          # int64 [N] or [B,S]
+    query: torch.Tensor,              # [N,H*D] or [N,H,D] or [B,S,H,D] or [B,S,H*D]
+    key: Optional[torch.Tensor],      # same logic or None
+    head_size: int,                   # D
+    cos_sin_cache: torch.Tensor,      # [max_position, rot_dim], SPLIT: [cos..., sin...]
+    is_neox: bool,                    # True=NeoX, False=GPT-J
 ) -> None:
-    torch.ops._C.rotary_embedding(positions, query, key, head_size,
-                                  cos_sin_cache, is_neox)
+    # --- validate / derive ---
+    if positions.dtype != torch.int64:
+        positions = positions.to(torch.long)
+    pos_flat = positions.contiguous().view(-1)                # [N]
+    N = int(pos_flat.numel())
+
+    dtype  = query.dtype
+    symbol = _KERNELS.get((dtype, is_neox))
+    if symbol is None:
+        raise NotImplementedError(f"No Nexus kernel for dtype={dtype}, is_neox={is_neox}")
+
+    if cos_sin_cache.dim() != 2:
+        raise ValueError("cos_sin_cache must be [max_position, rot_dim]")
+    rot_dim = int(cos_sin_cache.size(1))
+    if rot_dim % 2 != 0:
+        raise ValueError("rot_dim must be even")
+    if rot_dim > head_size:
+        raise ValueError("rot_dim must be <= head_size")
+
+    # hidden sizes → heads
+    q_hidden = query.numel() // N
+    if q_hidden % head_size != 0:
+        raise ValueError("query hidden_size not divisible by head_size")
+    H = q_hidden // head_size
+
+    if key is not None:
+        k_hidden = key.numel() // N
+        if k_hidden % head_size != 0:
+            raise ValueError("key hidden_size not divisible by head_size")
+        HKV = k_hidden // head_size
+    else:
+        HKV = H
+    if H % HKV != 0:
+        raise ValueError("num_heads must be a multiple of num_kv_heads")
+
+    # --- remember original shapes for safe copy-back ---
+    q_shape_orig = tuple(query.shape)
+    k_shape_orig = tuple(key.shape) if key is not None else None
+    D = int(head_size)
+
+    # --- canonical repack to [N,H,D] on CPU (ensures strides match kernel) ---
+    q_host_3d = query.contiguous().view(N, H, D).to(dtype).cpu().contiguous()
+    k_host_3d = None
+    if key is not None:
+        k_host_3d = key.contiguous().view(N, HKV, D).to(dtype).cpu().contiguous()
+
+    cache_host_flat = cos_sin_cache.to(dtype).contiguous().view(-1).cpu()  # [max_pos*rot_dim]
+
+    # strides in ELEMENTS for [N,H,D]
+    q_stride_e = H * D         # elems between tokens
+    k_stride_e = HKV * D if k_host_3d is not None else 0
+    head_stride_e = D          # elems between heads
+
+    # --- Nexus: buffers & launch ---
+    dev  = _pick_device()
+    lib  = dev.load_library_file(_PTX_PATH)
+    kern = lib.get_kernel(symbol)
+    if not kern:
+        raise RuntimeError(f"Nexus: failed to load kernel {symbol}")
+
+    b_pos   = dev.create_buffer(pos_flat)                     # int64 [N]
+    b_q     = dev.create_buffer(q_host_3d.view(-1))          # scalar_t [N*H*D]
+    b_k     = dev.create_buffer(k_host_3d.view(-1)) if k_host_3d is not None else None
+    b_cache = dev.create_buffer(cache_host_flat)             # scalar_t [max_pos*rot_dim]
+
+    sched = dev.create_schedule()
+    cmd   = sched.create_command(kern)
+
+    # args: ptrs, rot_dim(u32), strides(u64 elems), heads(u32), head_size(u32)
+    cmd.set_arg(0,  b_pos)
+    cmd.set_arg(1,  b_q)
+    if b_k is not None:
+        cmd.set_arg(2,  b_k)
+    else:
+        cmd.set_arg(2,  0, True)  # nullptr key
+    cmd.set_arg(3,  b_cache)
+    cmd.set_arg(4,  rot_dim)
+    cmd.set_arg(5,  int(q_stride_e), True)
+    cmd.set_arg(6,  int(k_stride_e), True)
+    cmd.set_arg(7,  int(head_stride_e), True)
+    cmd.set_arg(8,  int(H))
+    cmd.set_arg(9,  int(HKV))
+    cmd.set_arg(10, int(D))
+
+    threads_x = min(H * (rot_dim // 2), 512)
+    cmd.finalize(int(N), int(threads_x))
+
+    stream = dev.create_stream()
+    sched.run(stream, True)  # sync launch
+
+    # --- copy back to the original tensors (ANY shape/contiguity) ---
+    # reshape host output to original shape, then copy into destination
+    q_out_host_flat = torch.empty_like(q_host_3d.view(-1))
+    b_q.copy(q_out_host_flat)
+    q_out_host = q_out_host_flat.view(N, H, D).reshape(q_shape_orig)
+    query.copy_(q_out_host.to(device=query.device, dtype=query.dtype))
+
+    if key is not None:
+        k_out_host_flat = torch.empty_like(k_host_3d.view(-1))
+        b_k.copy(k_out_host_flat)
+        k_out_host = k_out_host_flat.view(N, HKV, D).reshape(k_shape_orig)
+        key.copy_(k_out_host.to(device=key.device, dtype=key.dtype))
+
+
+
+
+
+
+
+# pos encoding ops
+# def rotary_embedding(
+#     positions: torch.Tensor,
+#     query: torch.Tensor,
+#     key: Optional[torch.Tensor],
+#     head_size: int,
+#     cos_sin_cache: torch.Tensor,
+#     is_neox: bool,
+# ) -> None:
+#     torch.ops._C.rotary_embedding(positions, query, key, head_size,
+#                                   cos_sin_cache, is_neox)
 
 
 def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
