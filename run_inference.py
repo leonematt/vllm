@@ -20,6 +20,6 @@ llm = LLM(
 )
 
 print("Running inference...")
-outs = llm.generate(["What is AI?"], SamplingParams(max_tokens=10, temperature=0.7))
+outs = llm.generate(["What is software?"], SamplingParams(max_tokens=10, temperature=0.7))
 print("Generated:", outs[0].outputs[0].text)
 print("Done.")
