@@ -252,7 +252,7 @@ from typing import Optional
 import torch
 import nexus
 
-_PTX_PATH = "/home/leonematt/dev/nexus/build.local/cuda_kernels/pos_encoding_kernels.cu.ptx"
+_ROPE_PATH = "/home/leonematt/dev/nexus/build.local/cuda_kernels/pos_encoding_kernels.cu.ptx"
 _KERNELS = {
     # dtype, is_neox -> mangled symbol
     (torch.bfloat16, True):  "_ZN4vllm23rotary_embedding_kernelIN3c108BFloat16ELb1EEEvPKlPT_S6_PKS5_illliii",
@@ -263,15 +263,6 @@ _KERNELS = {
     # (torch.float16,  True):  "...",
     # (torch.float16,  False): "...",
 }
-
-def _pick_device() -> "nexus.Device":
-    rt = nexus.get_runtime("cuda")
-    if not rt:
-        raise RuntimeError("Nexus: no CUDA runtime")
-    for d in rt.get_devices():
-        if d.get_property_str(nexus.property.Type) == "gpu":
-            return d
-    raise RuntimeError("Nexus: no GPU device")
 
 def rotary_embedding(
     positions: torch.Tensor,          # int64 [N] or [B,S]
@@ -335,8 +326,10 @@ def rotary_embedding(
     head_stride_e = D          # elems between heads
 
     # --- Nexus: buffers & launch ---
-    dev  = _pick_device()
-    lib  = dev.load_library_file(_PTX_PATH)
+    rt = nexus.get_runtime("cuda")
+    dev = rt.get_devices()[0]
+
+    lib  = dev.load_library_file(_ROPE_PATH)
     kern = lib.get_kernel(symbol)
     if not kern:
         raise RuntimeError(f"Nexus: failed to load kernel {symbol}")
@@ -383,13 +376,7 @@ def rotary_embedding(
         b_k.copy(k_out_host_flat)
         k_out_host = k_out_host_flat.view(N, HKV, D).reshape(k_shape_orig)
         key.copy_(k_out_host.to(device=key.device, dtype=key.dtype))
-
-
-
-
-
-
-
+    
 # pos encoding ops
 # def rotary_embedding(
 #     positions: torch.Tensor,
@@ -401,6 +388,65 @@ def rotary_embedding(
 # ) -> None:
 #     torch.ops._C.rotary_embedding(positions, query, key, head_size,
 #                                   cos_sin_cache, is_neox)
+
+_RMS_PTX    = "/home/leonematt/dev/nexus/build.local/cuda_kernels/layernorm_kernels.cu.ptx"
+_RMS_SYMBOL = "_ZN4vllm15rms_norm_kernelIN3c108BFloat16EEEvPT_PKS3_lS6_fii"
+
+def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
+             epsilon: float) -> None:
+    # ---- derive [N, H] and make canonical contiguous host views ----
+    H = int(input.size(-1))
+    N = int(input.numel() // H)
+    #print("fuck yeah")
+    #exit()
+    # Make it [N, H] contiguous so stride(-2) == H (in ELEMENTS)
+    inp_host = input.contiguous().view(N, H).to(torch.bfloat16).cpu().contiguous()
+    w_host   = weight.contiguous().view(H).to(torch.bfloat16).cpu().contiguous()
+    out_host = torch.empty_like(inp_host)
+
+    stride_elems = H  # elements (PTX shifts by 1 for bf16 bytes)
+
+    # ---- Nexus: pick CUDA GPU device explicitly ----
+    rt  = nexus.get_runtime("cuda")
+    dev = rt.get_devices()[0]
+
+    # ---- Load PTX + kernel ----
+    lib  = dev.load_library_file(_RMS_PTX)
+    kern = lib.get_kernel(_RMS_SYMBOL)
+    if not kern:
+        raise RuntimeError(f"Nexus: failed to load kernel '{_RMS_SYMBOL}' from '{_RMS_PTX}'")
+
+    # ---- Buffers (host→device handled by Nexus) ----
+    b_out = dev.create_buffer(out_host.view(-1))  # T*
+    b_in  = dev.create_buffer(inp_host.view(-1))  # const T*
+    b_w   = dev.create_buffer(w_host.view(-1))    # const T*
+
+    # ---- Command & args (match PTX exactly) ----
+    # (out[u64], in[u64], input_stride[u64 elems], weight[u64],
+    #  epsilon[f32], num_tokens[u32], hidden_size[u32])
+    sched = dev.create_schedule()
+    cmd   = sched.create_command(kern)
+    cmd.set_arg(0, b_out)
+    cmd.set_arg(1, b_in)
+    cmd.set_arg(2, int(stride_elems), True)  # 64-bit scalar, ELEMENTS
+    cmd.set_arg(3, b_w)
+    cmd.set_arg(4, float(epsilon))
+    cmd.set_arg(5, int(N))
+    cmd.set_arg(6, int(H))
+
+    # ---- Launch (both 256 and 1024 are valid; 1024 is the safest) ----
+    block_x = 1024
+    cmd.finalize(int(N), int(block_x))
+
+    stream = dev.create_stream()
+    sched.run(stream, True)  # sync launch for deterministic errors
+
+    # ---- Copy back to caller’s device/dtype/shape ----
+    tmp = torch.empty_like(out_host.view(-1))
+    b_out.copy(tmp)
+    out.copy_(tmp.view_as(out_host).reshape_as(out).to(device=out.device, dtype=out.dtype))
+
+
 
 
 def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
@@ -414,11 +460,11 @@ def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
 
 
 # layer norm ops
-def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
-             epsilon: float) -> None:
-    # TODO: Remove this contiguous call when the kernel is updated to support non-contiguous input
-    input_contiguous = input.contiguous()
-    torch.ops._C.rms_norm(out, input_contiguous, weight, epsilon)
+# def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
+#             epsilon: float) -> None:
+#     TODO: Remove this contiguous call when the kernel is updated to support non-contiguous input
+#    input_contiguous = input.contiguous()
+#    torch.ops._C.rms_norm(out, input_contiguous, weight, epsilon)
 
 
 def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
