@@ -54,6 +54,104 @@ class FatreluAndMul(CustomOp):
         self.op(out, x, self.threshold)
         return out
 
+import torch
+import nexus
+
+_ACT_PTX = "/home/leonematt/dev/nexus/build.local/cuda_kernels/activation_kernels.cu.ptx"
+
+# bf16 specialization you provided (mul_and_silu → ACT_FIRST = false in your macro call)
+# Signature: (out[T*], input[T*], d[int])
+_ACT_AND_MUL_SYMBOL_BF16 = (
+    "_ZN4vllm18act_and_mul_kernelIN3c108BFloat16EXadL_ZNS_11silu_kernelIS2_EET_RKS4_EELb1EEEvPS4_PS5_i"
+)
+
+def mul_and_silu(
+    out: torch.Tensor,          # [..., d]
+    inp: torch.Tensor,          # [..., 2*d]
+    *,
+    dev=None,
+    stream=None,
+    ptx_path: str = _ACT_PTX,
+    symbol: str = _ACT_AND_MUL_SYMBOL_BF16  # override if your build mangling differs
+) -> None:
+    # ---- mirror C++ preconditions ----
+    if not out.is_contiguous():
+        raise ValueError("mul_and_silu: out must be contiguous")
+    if inp.stride(-1) != 1:
+        raise ValueError("mul_and_silu: last dim of input must be contiguous (stride(-1) == 1)")
+    if not inp.is_contiguous():
+        # Optional: enforce full contiguity (C++ only requires last-dim contiguous)
+        inp = inp.contiguous()
+
+    last = int(inp.size(-1))
+    if last % 2 != 0:
+        raise ValueError(f"mul_and_silu: input hidden size must be even, got {last}")
+    d = last // 2
+    if d <= 0:
+        return
+
+    N = int(inp.numel() // last)  # num_tokens
+    if N == 0:
+        return
+
+    if int(out.size(-1)) != d:
+        raise ValueError(f"mul_and_silu: out.size(-1)={int(out.size(-1))} != d={d}")
+    if out.numel() != N * d:
+        raise ValueError("mul_and_silu: out numel mismatch for [N, d]")
+
+    # dtype guard for the provided symbol (bf16)
+    if not (inp.dtype is torch.bfloat16 and out.dtype is torch.bfloat16):
+        raise TypeError("mul_and_silu: current PTX symbol is bf16-only; pass a different `symbol=` for other dtypes")
+
+    # ---- create tight [N, 2d] and [N, d] host views ----
+    x_host   = inp.view(N, 2 * d).to(torch.bfloat16).cpu().contiguous()
+    out_host = torch.empty((N, d), dtype=torch.bfloat16)
+
+    # ---- surface prior CUDA errors deterministically ----
+    if inp.is_cuda or out.is_cuda:
+        torch.cuda.synchronize()
+
+    # ---- device/stream ----
+    if dev is None:
+        rt = nexus.get_runtime("cuda")
+        dev = rt.get_devices()[0]
+    if stream is None:
+        stream = dev.create_stream()
+
+    # ---- load kernel ----
+    lib  = dev.load_library_file(ptx_path)
+    kern = lib.get_kernel(symbol)
+    if not kern:
+        raise RuntimeError(f"Nexus: failed to load kernel '{symbol}' from '{ptx_path}'")
+
+    # ---- buffers ----
+    b_out = dev.create_buffer(out_host.view(-1))   # T*
+    b_in  = dev.create_buffer(x_host.view(-1))     # T*
+
+    # ---- command & args (match signature exactly) ----
+    # (out[T*], input[T*], d[int])
+    sched = dev.create_schedule()
+    cmd   = sched.create_command(kern)
+    cmd.set_arg(0, b_out)
+    cmd.set_arg(1, b_in)
+    cmd.set_arg(2, int(d))   # int
+
+    # ---- launch: dim3 grid(num_tokens), block(min(d, 1024)) ----
+    block_x = min(d, 1024)
+    grid    = [N, 1, 1]
+    block   = [block_x, 1, 1]
+    cmd.finalize(grid, block)
+
+    sched.run(stream, True)  # sync launch
+
+    # ---- copy back into caller tensor (preserve device/dtype) ----
+    tmp = torch.empty_like(out_host.view(-1))
+    b_out.copy(tmp)
+    out.copy_(
+        tmp.view_as(out_host).reshape_as(out).to(device=out.device, dtype=out.dtype),
+        non_blocking=False,
+    )
+
 
 @CustomOp.register("silu_and_mul")
 class SiluAndMul(CustomOp):
@@ -69,7 +167,8 @@ class SiluAndMul(CustomOp):
     def __init__(self):
         super().__init__()
         if current_platform.is_cuda_alike():
-            self.op = torch.ops._C.silu_and_mul
+            #self.op = torch.ops._C.silu_and_mul
+            self.op = mul_and_silu
         elif current_platform.is_xpu():
             from vllm._ipex_ops import ipex_ops
             self.op = ipex_ops.silu_and_mul
